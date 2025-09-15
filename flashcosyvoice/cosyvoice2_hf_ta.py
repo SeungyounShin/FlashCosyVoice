@@ -3,8 +3,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
 TORCHDYNAMO_DISABLE=1 \
 python -m flashcosyvoice.cosyvoice2_hf_ta \
 --model_path /home/robin/FlashCosyVoice/CosyVoice2-0.5B \
---prompt_wav /home/robin/ch-llasa-tts-training/assets/esther.wav \
---text "안녕하세요 무엇을 어떻게 도와드릴까요?" \
+--prompt_wav /home/robin/ch-llasa-tts-training/assets/joseph_1.wav \
+--text "안녕하세요 TTS 테스트 중입니다. 저는 남자 목소리입니다." \
 --out out.json \
 --out_wav out.wav \
 --fp16_flow
@@ -24,6 +24,7 @@ import torchaudio.compliance.kaldi as kaldi
 
 import s3tokenizer
 from flashcosyvoice.config import Config, CosyVoice2LLMConfig, SamplingParams
+from flashcosyvoice.token2wav import Token2wav
 
 
 def build_hf_model(model_path: str, hf_cfg: CosyVoice2LLMConfig) -> tuple[Qwen2ForCausalLM, AutoTokenizer, int]:
@@ -131,42 +132,6 @@ def main():
     cfg = Config(model=args.model_path, hf_config=CosyVoice2LLMConfig())
     hf_model, llm_tokenizer, eos_id = build_hf_model(args.model_path, cfg.hf_config)
 
-    # -------------------- Flow & HiFi-GAN --------------------
-    flow = CausalMaskedDiffWithXvec()
-    if cfg.hf_config.fp16_flow or args.fp16_flow:
-        flow.half()
-    flow.load_state_dict(torch.load(f"{args.model_path}/flow.pt", map_location="cpu", weights_only=True), strict=True)
-    flow = flow.cuda().eval()
-
-    hift = HiFTGenerator()
-    hift_sd = torch.load(f"{args.model_path}/hift.pt", map_location="cpu", weights_only=True)
-    hift.load_state_dict({k.replace('generator.', ''): v for k, v in hift_sd.items()}, strict=True)
-    hift = hift.cuda().eval()
-
-    # -------------------- Speaker embedding (campplus.onnx) --------------------
-    audio_16k = s3tokenizer.load_audio(args.prompt_wav, sr=16000)
-    option = onnxruntime.SessionOptions()
-    option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    option.intra_op_num_threads = 1
-    spk_sess = onnxruntime.InferenceSession(
-        os.path.join(args.model_path, "campplus.onnx"),
-        sess_options=option,
-        providers=["CPUExecutionProvider"]
-    )
-    spk_feat = kaldi.fbank(audio_16k.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
-    spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-    spk_emb_np = spk_sess.run(None, {spk_sess.get_inputs()[0].name: spk_feat.unsqueeze(0).cpu().numpy()})[0]
-    spk_emb_for_flow = torch.tensor(spk_emb_np, device="cuda")
-
-    # -------------------- Flow prompt mel (24k) --------------------
-    audio, sr = torchaudio.load(args.prompt_wav, backend="soundfile")
-    audio = audio.mean(dim=0, keepdim=True)
-    if sr != 24000:
-        audio = torchaudio.transforms.Resample(orig_freq=sr, new_freq=24000)(audio)
-    prompt_mel = mel_spectrogram(audio).transpose(1, 2).squeeze(0)  # [T, 80]
-    prompt_mels_for_flow = torch.nn.utils.rnn.pad_sequence([prompt_mel], batch_first=True, padding_value=0)
-    prompt_mels_lens_for_flow = torch.tensor([prompt_mels_for_flow.shape[1]], dtype=torch.int32)
-
     # -------------------- LLM: text2 -> speech tokens --------------------
     input_ids = build_input_ids_text_only(
         tokenizer=llm_tokenizer,
@@ -212,26 +177,11 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    # -------------------- Flow -> mel -> HiFi-GAN -> wav --------------------
-    # 이제 flow 입력은 '생성된 스피치 토큰'만 사용
-    flow_inputs = torch.nn.utils.rnn.pad_sequence(
-        [torch.tensor(out_ids, dtype=torch.long)],
-        batch_first=True,
-        padding_value=0
-    )
-    flow_inputs_lens = torch.tensor([len(out_ids)], dtype=torch.int32)
-
-    with torch.amp.autocast("cuda", dtype=torch.float16 if (cfg.hf_config.fp16_flow or args.fp16_flow) else torch.float32):
-        batch_generated_mels, batch_generated_mels_lens = flow(
-            flow_inputs.cuda(), flow_inputs_lens.cuda(),
-            prompt_mels_for_flow.cuda(), prompt_mels_lens_for_flow.cuda(), spk_emb_for_flow.cuda(),
-            streaming=False, finalize=True
-        )
-
-    # flow 출력에는 프롬프트 멜이 앞에 붙어 있으므로 그 길이만큼 잘라서 합성부만 사용
-    mel = batch_generated_mels[0, :, prompt_mels_lens_for_flow[0].item():batch_generated_mels_lens[0].item()].unsqueeze(0)
-    wav, _ = hift(speech_feat=mel)
-    torchaudio.save(args.out_wav, wav.detach().cpu(), 24000)
+    # Token2wav로 바로 합성
+    t2w = Token2wav(args.model_path, float16=(cfg.hf_config.fp16_flow or args.fp16_flow))
+    audio_bytes = t2w(out_ids, args.prompt_wav)
+    with open(args.out_wav, "wb") as f:
+        f.write(audio_bytes)
     print(f"Saved: {args.out} and {args.out_wav}")
 
 
